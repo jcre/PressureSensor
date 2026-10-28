@@ -1,6 +1,7 @@
 import 'adv_packet.dart';
 import 'bthome.dart';
 import 'field_spec.dart';
+import 'known_layouts.dart';
 
 enum DecoderKind {
   /// Recognise known open formats (currently BTHome v2) automatically.
@@ -78,16 +79,21 @@ class SensorValues {
 
 class AdvDecoder {
   static SensorValues decode(AdvPacket packet, DecoderProfile profile) {
-    switch (profile.kind) {
-      case DecoderKind.auto:
-        return decodeKnownFormats(packet);
-      case DecoderKind.custom:
-        return SensorValues(
+    final v = switch (profile.kind) {
+      DecoderKind.auto => decodeKnownFormats(packet),
+      DecoderKind.custom => SensorValues(
           pressureHpa: profile.pressure?.read(packet),
           temperatureC: profile.temperature?.read(packet),
           batteryPct: profile.battery?.read(packet),
-        );
-    }
+        ),
+    };
+    if (v.batteryPct != null) return v;
+    // Fall back to the Holyiot / NexBeacon battery byte.
+    return SensorValues(
+      pressureHpa: v.pressureHpa,
+      temperatureC: v.temperatureC,
+      batteryPct: KnownLayouts.battery(packet),
+    );
   }
 
   static SensorValues decodeKnownFormats(AdvPacket packet) {

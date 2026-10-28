@@ -122,6 +122,16 @@ void main() {
     await settle(tester);
     expect(find.text('Service 0xfcd2  (10 bytes)'), findsOneWidget);
     await shot(tester, '3_inspector');
+
+    // Trends: feed the open inspector 4 minutes of demo packets.
+    final base = DateTime.now().subtract(const Duration(minutes: 4));
+    for (var t = 0; t < 240; t++) {
+      scanner.inject(DemoSimulation.packet(Duration(seconds: 60 + t), base.add(Duration(seconds: t))));
+    }
+    await tester.tap(find.text('Trends'));
+    await settle(tester);
+    expect(find.textContaining('bytes 8–10'), findsWidgets); // the demo pressure field
+    await shot(tester, '3b_trends');
     await tester.pageBack();
     await settle(tester);
 

@@ -42,12 +42,20 @@ and the two apps' firmwares probably differ. So the app doesn't assume a format:
      against your **phone's barometer**, or against the value the vendor app
      shows (type it in and use a small tolerance). Pick the top match, then
      squeeze or breathe on the sensor and check the value moves.
-   - Do the same for temperature if you want it. Battery can be set by hand.
+   - Do the same for temperature if you want it. Battery is picked up
+     automatically for the known Holyiot (`0x5242`, byte 1) and NexBeacon Pro
+     (`0x180A`, last byte) layouts, and can be set by hand otherwise.
+   - **Trends** view: every number in the broadcast (1–4 byte integers,
+     either byte order) ranked by how much it changed over the last 5
+     minutes, with a mini graph for each. Warm the tag in your hand or squeeze
+     it and watch which rows move; tap a row to use it as pressure,
+     temperature or battery. Bytes already identified (battery, MAC address,
+     BTHome headers) are labelled and left out.
 4. **Use this sensor**, then tap **Zero** while the sensor is still at outside
    pressure (before you seal the raft, or with the valve open).
 
 If nothing matches, tap the copy icon in the inspector to copy a log of the raw
-packets. Paste it somewhere and the layout can usually be worked out by eye.
+packets (the last 5 minutes, with timestamps). Paste it somewhere and the layout can usually be worked out by eye.
 
 ## Things worth knowing
 

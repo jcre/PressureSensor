@@ -71,6 +71,28 @@ class BTHome {
     0xF2: (3, false, 1), // firmware version
   };
 
+  /// Positions of the header and object-id bytes (everything that isn't a
+  /// measurement), or null if this isn't unencrypted BTHome v2.
+  static Set<int>? structureBytes(Uint8List data) {
+    if (data.isEmpty || data[0] & 0x01 != 0 || (data[0] >> 5) & 0x07 != 2) return null;
+    final out = <int>{0};
+    var i = 1;
+    while (i < data.length) {
+      out.add(i);
+      final id = data[i++];
+      if (id == 0x53 || id == 0x54) {
+        if (i >= data.length) break;
+        out.add(i);
+        i += 1 + data[i];
+        continue;
+      }
+      final spec = _objects[id];
+      if (spec == null) break;
+      i += spec.$1;
+    }
+    return out;
+  }
+
   /// Returns the decoded objects as id -> list of values (an id can repeat),
   /// or null if this is not an unencrypted BTHome v2 payload.
   static Map<int, List<double>>? decode(Uint8List data) {

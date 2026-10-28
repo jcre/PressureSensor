@@ -8,6 +8,8 @@ import '../ble/adv_packet.dart';
 import '../ble/decoder.dart';
 import '../ble/field_finder.dart';
 import '../ble/field_spec.dart';
+import '../ble/known_layouts.dart';
+import '../ble/trend_analysis.dart';
 import '../models/sensor_config.dart';
 import '../services/barometer_service.dart';
 import '../services/ble_scanner.dart';
@@ -32,7 +34,18 @@ class _InspectorScreenState extends State<InspectorScreen> {
   late TextEditingController _name;
   DateTime _lastRedraw = DateTime.fromMillisecondsSinceEpoch(0);
 
-  static const _keep = 40;
+  /// History kept for trends, the packet log and Find.
+  static const _window = Duration(minutes: 5);
+  static const _maxPackets = 3000;
+
+  /// Find compares against recent packets only, so squeezing the sensor a
+  /// minute ago doesn't spoil the match.
+  static const _findWindow = Duration(seconds: 30);
+
+  bool _showTrends = false;
+  TrendSort _trendSort = TrendSort.smooth;
+  List<TrendField> _trends = const [];
+  DateTime _trendsAt = DateTime.fromMillisecondsSinceEpoch(0);
 
   @override
   void initState() {
@@ -46,8 +59,18 @@ class _InspectorScreenState extends State<InspectorScreen> {
         text: existing?.name ?? (seen == null || seen.name.isEmpty ? 'Raft sensor' : seen.name));
     if (seen != null) _packets.add(seen);
     _sub = _scanner.packets.where((p) => p.deviceId == widget.deviceId).listen((p) {
-      _packets.add(p);
-      if (_packets.length > _keep) _packets.removeAt(0);
+      // Keep time order even if a packet turns up late.
+      var at = _packets.length;
+      while (at > 0 && _packets[at - 1].time.isAfter(p.time)) {
+        at--;
+      }
+      _packets.insert(at, p);
+      final cutoff = _packets.last.time.subtract(_window);
+      var drop = 0;
+      while (drop < _packets.length && (_packets[drop].time.isBefore(cutoff) || _packets.length - drop > _maxPackets)) {
+        drop++;
+      }
+      if (drop > 0) _packets.removeRange(0, drop);
       final now = DateTime.now();
       if (now.difference(_lastRedraw) > const Duration(milliseconds: 400) && mounted) {
         _lastRedraw = now;
@@ -66,6 +89,29 @@ class _InspectorScreenState extends State<InspectorScreen> {
   }
 
   AdvPacket? get _latest => _packets.lastOrNull;
+
+  List<AdvPacket> get _recent {
+    final last = _latest;
+    if (last == null) return const [];
+    final cutoff = last.time.subtract(_findWindow);
+    return _packets.where((p) => !p.time.isBefore(cutoff)).toList();
+  }
+
+  /// Recomputed at most every 2 s; it reads every field of every packet.
+  List<TrendField> _currentTrends() {
+    final now = DateTime.now();
+    if (now.difference(_trendsAt) > const Duration(seconds: 2)) {
+      _trendsAt = now;
+      _trends = TrendAnalysis.analyze(_packets, sort: _trendSort);
+    }
+    return _trends;
+  }
+
+  String get _bufferSpan {
+    if (_packets.length < 2) return '';
+    final s = _packets.last.time.difference(_packets.first.time).inSeconds;
+    return s < 60 ? ' over ${s}s' : ' over ${s ~/ 60}m ${s % 60}s';
+  }
 
   /// Byte positions whose value changed across the recent packets.
   Set<int> _changing(AdBlock block) {
@@ -103,23 +149,43 @@ class _InspectorScreenState extends State<InspectorScreen> {
           TextField(controller: _name, decoration: const InputDecoration(labelText: 'Sensor name')),
           const SizedBox(height: 8),
           Text(
-            '${widget.deviceId}   ·   ${latest == null ? 'waiting for data…' : '${latest.rssi} dBm   ·   ${_packets.length} packets'}',
+            '${widget.deviceId}   ·   ${latest == null ? 'waiting for data…' : '${latest.rssi} dBm   ·   ${_packets.length} packets$_bufferSpan'}',
             style: TextStyle(color: scheme.outline),
           ),
           const SizedBox(height: 12),
-          Text('Raw data', style: Theme.of(context).textTheme.titleMedium),
-          const Text(
-            'Byte numbers start after the service UUID / company ID. Highlighted bytes are changing – '
-            'pressure bytes will change when you squeeze or blow on the sensor.',
-            style: TextStyle(fontSize: 12),
+          SegmentedButton<bool>(
+            segments: const [
+              ButtonSegment(value: false, icon: Icon(Icons.grid_view), label: Text('Bytes')),
+              ButtonSegment(value: true, icon: Icon(Icons.show_chart), label: Text('Trends')),
+            ],
+            selected: {_showTrends},
+            onSelectionChanged: (s) => setState(() {
+              _showTrends = s.first;
+              _trendsAt = DateTime.fromMillisecondsSinceEpoch(0);
+            }),
           ),
           const SizedBox(height: 8),
           if (latest == null)
             const Padding(padding: EdgeInsets.all(24), child: Center(child: CircularProgressIndicator()))
           else if (!latest.hasPayload)
             const Text('This device broadcasts no service or manufacturer data.')
-          else
-            for (final block in latest.blocks) _BlockView(block: block, changing: _changing(block)),
+          else if (_showTrends)
+            ..._trendsView()
+          else ...[
+            const Text(
+              'Byte numbers start after the service UUID / company ID. Highlighted bytes are changing – '
+              'pressure bytes will change when you squeeze or blow on the sensor. Bytes we already '
+              'recognise are labelled.',
+              style: TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            for (final block in latest.blocks)
+              _BlockView(
+                block: block,
+                changing: _changing(block),
+                labels: KnownLayouts.annotate(latest)[KnownLayouts.blockId(block)] ?? const {},
+              ),
+          ],
           if (latest != null && latest.name.isNotEmpty)
             Text('Name: ${latest.name}${latest.serviceUuids.isEmpty ? '' : '   ·   UUIDs: ${latest.serviceUuids.join(', ')}'}',
                 style: const TextStyle(fontSize: 12)),
@@ -179,6 +245,64 @@ class _InspectorScreenState extends State<InspectorScreen> {
         ],
       ),
     );
+  }
+
+  List<Widget> _trendsView() {
+    final trends = _currentTrends();
+    final scheme = Theme.of(context).colorScheme;
+    return [
+      Text(
+        'Every number the tag broadcasts, read as 1–4 byte integers, ranked by how much it changed in '
+        'the last 5 minutes$_bufferSpan. Warm the sensor in your hand or squeeze it and watch which '
+        'rows move. "Smooth change" ignores bytes that just jitter. Tap a row to use it.',
+        style: const TextStyle(fontSize: 12),
+      ),
+      const SizedBox(height: 8),
+      SegmentedButton<TrendSort>(
+        showSelectedIcon: false,
+        style: const ButtonStyle(visualDensity: VisualDensity.compact),
+        segments: [for (final s in TrendSort.values) ButtonSegment(value: s, label: Text(s.label))],
+        selected: {_trendSort},
+        onSelectionChanged: (s) => setState(() {
+          _trendSort = s.first;
+          _trendsAt = DateTime.fromMillisecondsSinceEpoch(0);
+        }),
+      ),
+      const SizedBox(height: 8),
+      if (trends.isEmpty)
+        Padding(
+          padding: const EdgeInsets.all(16),
+          child: Text(
+            _packets.length < 2 ? 'Collecting packets…' : 'Nothing has changed yet. Try warming or squeezing the sensor.',
+            style: TextStyle(color: scheme.outline),
+          ),
+        ),
+      for (final f in trends) _TrendRow(field: f, onTap: () => _useTrend(f)),
+    ];
+  }
+
+  Future<void> _useTrend(TrendField f) async {
+    final target = await showModalBottomSheet<String>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          ListTile(title: Text(f.spec.describe()), subtitle: const Text('Use this field as…')),
+          for (final t in const ['Pressure', 'Temperature', 'Battery'])
+            ListTile(title: Text(t), onTap: () => Navigator.pop(ctx, t)),
+        ]),
+      ),
+    );
+    if (target == null || !mounted) return;
+    // Raw value for now; the dialog shows it live so the scale can be set.
+    switch (target) {
+      case 'Pressure':
+        await _edit('Pressure (hPa)', f.spec, (x) => _profile.copyWith(pressure: x));
+      case 'Temperature':
+        await _edit('Temperature (°C)', f.spec, (x) => _profile.copyWith(temperature: x));
+      case 'Battery':
+        await _edit('Battery (%)', f.spec, (x) => _profile.copyWith(battery: x));
+    }
   }
 
   Future<void> _save() async {
@@ -249,7 +373,7 @@ class _InspectorScreenState extends State<InspectorScreen> {
     final tl = double.tryParse(tol.text.replaceAll(',', '.'));
     if (go != true || t == null || tl == null || !mounted) return;
 
-    final found = FieldFinder.find(packets: _packets, quantity: q, target: t, tolerance: tl);
+    final found = FieldFinder.find(packets: _recent, quantity: q, target: t, tolerance: tl);
     final picked = await showModalBottomSheet<FieldCandidate>(
       context: context,
       showDragHandle: true,
@@ -304,10 +428,11 @@ class _InspectorScreenState extends State<InspectorScreen> {
 }
 
 class _BlockView extends StatelessWidget {
-  const _BlockView({required this.block, required this.changing});
+  const _BlockView({required this.block, required this.changing, this.labels = const {}});
 
   final AdBlock block;
   final Set<int> changing;
+  final Map<int, String> labels;
 
   @override
   Widget build(BuildContext context) {
@@ -337,7 +462,12 @@ class _BlockView extends StatelessWidget {
                       children: [
                         Text(toHex([block.bytes[i]]),
                             style: const TextStyle(fontFamily: 'monospace', fontWeight: FontWeight.w600)),
-                        Text('$i', style: TextStyle(fontSize: 9, color: scheme.outline)),
+                        Text(labels[i] ?? '$i',
+                            style: TextStyle(
+                              fontSize: 9,
+                              color: labels.containsKey(i) ? scheme.primary : scheme.outline,
+                              fontWeight: labels.containsKey(i) ? FontWeight.w700 : null,
+                            )),
                       ],
                     ),
                   ),
@@ -508,4 +638,91 @@ class _FieldSpecDialogState extends State<_FieldSpecDialog> {
       ],
     );
   }
+}
+
+class _TrendRow extends StatelessWidget {
+  const _TrendRow({required this.field, required this.onTap});
+
+  final TrendField field;
+  final VoidCallback onTap;
+
+  static String _num(double v) => v == v.roundToDouble() ? v.toStringAsFixed(0) : v.toStringAsFixed(2);
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final s = field.spec;
+    final bytes = s.length == 1 ? 'byte ${s.offset}' : 'bytes ${s.offset}–${s.offset + s.length - 1}';
+    final type = '${s.type == FieldType.sint ? 's' : 'u'}int${s.length * 8}${s.length > 1 ? (s.littleEndian ? ' LE' : ' BE') : ''}';
+    final delta = field.last - field.first;
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 3),
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('${s.source == AdSource.serviceData ? 'Svc' : 'Mfr'} 0x${s.key} · $bytes · $type',
+                        style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+                    Text(
+                      'now ${_num(field.last)}   Δ ${delta >= 0 ? '+' : ''}${_num(delta)}\n'
+                      'min ${_num(field.min)} · max ${_num(field.max)}',
+                      style: TextStyle(fontSize: 12, color: scheme.outline),
+                    ),
+                  ],
+                ),
+              ),
+              SizedBox(
+                width: 110,
+                height: 40,
+                child: CustomPaint(painter: _SparklinePainter(field.series, scheme.primary)),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _SparklinePainter extends CustomPainter {
+  _SparklinePainter(this.series, this.color);
+
+  final List<TrendSample> series;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (series.length < 2) return;
+    canvas.clipRect(Offset.zero & size);
+    final t0 = series.first.time.millisecondsSinceEpoch;
+    final span = (series.last.time.millisecondsSinceEpoch - t0).clamp(1, 1 << 62);
+    var lo = series.first.value, hi = lo;
+    for (final s in series) {
+      if (s.value < lo) lo = s.value;
+      if (s.value > hi) hi = s.value;
+    }
+    final range = hi - lo == 0 ? 1 : hi - lo;
+    final path = Path();
+    for (var i = 0; i < series.length; i++) {
+      final x = (series[i].time.millisecondsSinceEpoch - t0) / span * size.width;
+      final y = size.height - (series[i].value - lo) / range * size.height;
+      i == 0 ? path.moveTo(x, y) : path.lineTo(x, y);
+    }
+    canvas.drawPath(
+      path,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.5,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SparklinePainter old) => old.series != series || old.color != color;
 }
