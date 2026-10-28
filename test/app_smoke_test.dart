@@ -29,7 +29,7 @@ void main() {
   setUpAll(() async {
     // Plugins that don't exist in the test VM.
     final messenger = TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
-    for (final ch in ['flutter_ringtone_player', 'vibration']) {
+    for (final ch in ['vibration']) {
       messenger.setMockMethodCallHandler(MethodChannel(ch), (_) async => null);
     }
     messenger.setMockMethodCallHandler(

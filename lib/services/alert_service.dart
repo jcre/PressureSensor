@@ -3,7 +3,6 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
-import 'package:flutter_ringtone_player/flutter_ringtone_player.dart';
 import 'package:vibration/vibration.dart';
 
 import '../models/alert_settings.dart';
@@ -14,11 +13,11 @@ import 'alert_engine.dart';
 /// alarm currently sounding so the UI can offer a "Stop" button.
 class AlertService extends ChangeNotifier {
   final _notifications = FlutterLocalNotificationsPlugin();
-  final _ringtone = FlutterRingtonePlayer();
 
   AlertEvent? activeAlarm;
   DateTime? activeSince;
   Timer? _autoStop;
+  int? _alarmId;
   bool _initialised = false;
 
   Future<void> init() async {
@@ -74,21 +73,6 @@ class AlertService extends ChangeNotifier {
       notifyListeners();
     }
 
-    try {
-      switch (a.sound) {
-        case AlertSound.none:
-          break;
-        case AlertSound.beep:
-          await _ringtone.playNotification(asAlarm: true);
-        case AlertSound.alarm:
-          await _ringtone.playAlarm(looping: true, asAlarm: true);
-          _autoStop?.cancel();
-          _autoStop = Timer(Duration(seconds: alarmMaxSeconds), stop);
-      }
-    } catch (e) {
-      debugPrint('Sound failed: $e');
-    }
-
     if (a.vibrate) {
       try {
         if (await Vibration.hasVibrator()) {
@@ -99,33 +83,66 @@ class AlertService extends ChangeNotifier {
       }
     }
 
-    if (a.notify) {
-      try {
-        await _notifications.show(
-          id: event.kind.index + 100,
-          title: title(event.kind),
-          body: body,
-          notificationDetails: NotificationDetails(
-            android: AndroidNotificationDetails(
-              'alerts',
-              'Pressure alerts',
-              channelDescription: 'High / low raft pressure and lost-sensor alerts',
-              importance: Importance.max,
-              priority: Priority.high,
-              // Our own sound/vibration handles the noise; keep the notification quiet
-              // so it doesn't double up.
-              playSound: false,
-              enableVibration: false,
-              category: AndroidNotificationCategory.alarm,
-            ),
-            iOS: const DarwinNotificationDetails(presentAlert: true, presentSound: false),
-          ),
-        );
-      } catch (e) {
-        debugPrint('Notification failed: $e');
-      }
+    // Sound is played by the notification itself, so it works with the screen
+    // off. The alarm channel uses the phone's alarm tone on the alarm volume
+    // stream and loops ("insistent") until the notification is cancelled.
+    if (a.sound == AlertSound.none && !a.notify) return;
+    final id = event.kind.index + 100;
+    if (a.sound == AlertSound.alarm) {
+      _alarmId = id;
+      _autoStop?.cancel();
+      _autoStop = Timer(Duration(seconds: alarmMaxSeconds), stop);
+    }
+    try {
+      await _notifications.show(
+        id: id,
+        title: title(event.kind),
+        body: body,
+        notificationDetails: NotificationDetails(
+          android: _androidDetails(a.sound),
+          iOS: DarwinNotificationDetails(presentAlert: true, presentSound: a.sound != AlertSound.none),
+        ),
+      );
+    } catch (e) {
+      debugPrint('Notification failed: $e');
     }
   }
+
+  /// One channel per sound: Android fixes a channel's sound once created.
+  static AndroidNotificationDetails _androidDetails(AlertSound sound) => switch (sound) {
+        AlertSound.alarm => AndroidNotificationDetails(
+            'alerts_alarm',
+            'Pressure alarms',
+            channelDescription: 'Looping alarm for high / low raft pressure',
+            importance: Importance.max,
+            priority: Priority.high,
+            category: AndroidNotificationCategory.alarm,
+            sound: const UriAndroidNotificationSound('content://settings/system/alarm_alert'),
+            audioAttributesUsage: AudioAttributesUsage.alarm,
+            enableVibration: false, // vibration is handled separately
+            additionalFlags: Int32List.fromList([_flagInsistent]),
+          ),
+        AlertSound.beep => const AndroidNotificationDetails(
+            'alerts_beep',
+            'Pressure alerts (beep)',
+            channelDescription: 'Single notification sound',
+            importance: Importance.max,
+            priority: Priority.high,
+            enableVibration: false,
+          ),
+        AlertSound.none => const AndroidNotificationDetails(
+            'alerts_silent',
+            'Pressure alerts (silent)',
+            channelDescription: 'Silent notifications',
+            importance: Importance.high,
+            priority: Priority.high,
+            playSound: false,
+            enableVibration: false,
+          ),
+      };
+
+  /// android.app.Notification.FLAG_INSISTENT: repeat the sound until cancelled.
+  static const _flagInsistent = 4;
 
   Future<void> stop() async {
     _autoStop?.cancel();
@@ -133,15 +150,17 @@ class AlertService extends ChangeNotifier {
     activeAlarm = null;
     activeSince = null;
     notifyListeners();
+    final id = _alarmId;
+    _alarmId = null;
     try {
-      await _ringtone.stop();
+      if (id != null) await _notifications.cancel(id: id);
       await Vibration.cancel();
     } catch (_) {}
   }
 
   /// Plays an action set so the user can hear what it sounds like.
   Future<void> test(AlertActions actions, {required PressureUnit unit, required int alarmMaxSeconds}) =>
-      fire(AlertEvent(AlertKind.high, null, actions.copyWith(notify: false)),
+      fire(AlertEvent(AlertKind.high, null, actions),
           unit: unit, alarmMaxSeconds: alarmMaxSeconds.clamp(1, 5));
 
   @override
